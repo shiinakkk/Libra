@@ -14,6 +14,7 @@ from RL_Framework.infra.scheduling.base import (
     BaseScheduler,
     InstanceHandle,
     LoadBalanceStrategy,
+    MetricsFeedbackConfig,
     SchedulingResult,
 )
 from RL_Framework.infra.scheduling.cmlfq_prefix_tree import (
@@ -49,6 +50,7 @@ class CMLFQRequestState:
     total_output_tokens: int = 0
     created_at: float = field(default_factory=time.time)
     has_migrated: bool = False
+    input_tokens: int = 0
 
 
 @dataclass
@@ -90,8 +92,28 @@ class CMLFQScheduler(BaseScheduler):
         shared_load_dir: str = "",
         shared_load_ttl_s: float = 60.0,
         shared_load_heartbeat_s: float = 10.0,
+        load_metric: str = "tokens",
+        kv_capacity_tokens_by_tp: dict[int, int] | None = None,
+        feedback: MetricsFeedbackConfig | None = None,
+        prefix_affinity: bool = False,
+        prefix_affinity_max_entries: int = 8192,
     ):
-        super().__init__(name="C-MLFQ")
+        # In-bucket selection reuses the base ranking stack (capacity
+        # normalization, cross-rank aggregate, /metrics bias, occupancy
+        # admission, equal-load rotation). Only the BASE ESTIMATE differs:
+        # ``active_tokens`` here is the sum of prefix-tree residual charges
+        # (see ``_set_request_charge``), not the per-category output EMA
+        # that ``_record_route`` would install. Hence "tokens" rather than
+        # the base default "requests" -- ranking peers by request count
+        # throws that estimate away.
+        super().__init__(
+            name="C-MLFQ",
+            load_metric=load_metric,
+            kv_capacity_tokens_by_tp=kv_capacity_tokens_by_tp,
+            feedback=feedback,
+            prefix_affinity=prefix_affinity,
+            prefix_affinity_max_entries=prefix_affinity_max_entries,
+        )
 
 
         self._buckets = buckets or dict(self.DEFAULT_BUCKETS)
@@ -142,6 +164,10 @@ class CMLFQScheduler(BaseScheduler):
             if shared_load_dir
             else None
         )
+        # One state object serves both ranking paths: our own
+        # ``_active_count`` reads and ``load_of``'s aggregate layer.
+        if self._shared_load is not None:
+            self.attach_shared_state(self._shared_load)
 
 
         self.prefix_tree = prefix_tree or CausalPrefixTree()
@@ -153,6 +179,14 @@ class CMLFQScheduler(BaseScheduler):
 
 
         self._request_states: dict[str, CMLFQRequestState] = {}
+        # request_id -> (instance_index, charged_tokens). Our book of
+        # record for in-flight token load: each entry is context +
+        # E[residual] from the prefix tree, revised on every tool return
+        # and relocated on migration. Bucket peers share a TP degree, so
+        # ``load_of`` ranks them on the sum of these charges rather than
+        # on raw request counts. No learned EMA by design -- the tree's
+        # conditional histogram is the estimator.
+        self._request_charges: dict[str, tuple[int, int]] = {}
         self._recent_trajectories: list[Trajectory] = []
 
 
@@ -197,12 +231,27 @@ class CMLFQScheduler(BaseScheduler):
 
 
         if result.instance_index >= 0:
-            self._request_states[request_id] = CMLFQRequestState(
-                request_id=request_id,
-                prompt_id=prompt_id,
-                current_bucket=result.category,
-                current_instance_index=result.instance_index if result.instance_index >= 0 else -1,
-            )
+            with self._lock:
+                self._request_states[request_id] = CMLFQRequestState(
+                    request_id=request_id,
+                    prompt_id=prompt_id,
+                    current_bucket=result.category,
+                    current_instance_index=result.instance_index if result.instance_index >= 0 else -1,
+                    input_tokens=max(0, int(input_tokens)),
+                )
+                # Initial token charge: prompt + expected residual from the
+                # tree root (no tool history yet). Falls back to the shortest
+                # bucket's midpoint prior when the tree has no observations.
+                prior = self._expected_residual(
+                    prompt_id, [], shortest_bucket
+                )
+                self._set_request_charge(
+                    request_id, result.instance_index,
+                    int(max(0, int(input_tokens)) + prior),
+                )
+                handle = self.get_instance_handle(result.instance_index)
+                if handle is not None:
+                    self._affinity_record(prompt_id, handle)
             result.request_id = request_id
 
         return result
@@ -236,6 +285,23 @@ class CMLFQScheduler(BaseScheduler):
         req_state.collected_return_states.append(tool_state)
         req_state.tool_return_token_positions.append(generated_tokens)
 
+        # Refresh this request's token reservation on its current instance:
+        # the tool history just changed, so the residual expectation (and
+        # therefore its weight for in-bucket ranking) changed with it.
+        with self._lock:
+            self._set_request_charge(
+                request_id,
+                req_state.current_instance_index,
+                int(
+                    req_state.input_tokens
+                    + req_state.generated_tokens
+                    + self._expected_residual(
+                        req_state.prompt_id,
+                        req_state.collected_return_states,
+                        req_state.current_bucket,
+                    )
+                ),
+            )
 
         node = self.prefix_tree.lookup_with_fallback(
             req_state.prompt_id,
@@ -312,17 +378,35 @@ class CMLFQScheduler(BaseScheduler):
             input_tokens=0,
             prompt_id=req_state.prompt_id,
             reason="cmlfq_migration",
+            allow_affinity=False,
         )
 
         if result.instance_index >= 0:
             old_handle = self.get_instance_handle(old_idx)
             if old_handle:
                 with self._lock:
+                    # Count-only: the charge is relocated to the
+                    # destination handle below, not released.
                     self._decrement_active(old_handle)
             req_state.current_bucket = result.category
             req_state.current_instance_index = result.instance_index
             moved = result.instance_index != old_idx
             req_state.has_migrated = req_state.has_migrated or moved
+            # Re-charge on the destination with the freshest residual.
+            with self._lock:
+                self._set_request_charge(
+                    request_id,
+                    result.instance_index,
+                    int(
+                        req_state.input_tokens
+                        + req_state.generated_tokens
+                        + self._expected_residual(
+                            req_state.prompt_id,
+                            req_state.collected_return_states,
+                            result.category,
+                        )
+                    ),
+                )
             result.request_id = request_id
             self._migration_count += int(moved)
             with self._lock:
@@ -397,10 +481,22 @@ class CMLFQScheduler(BaseScheduler):
         if req_state is None:
             return
 
-        handle = self.get_instance_handle(req_state.current_instance_index)
-        if handle:
-            with self._lock:
-                self._decrement_active(handle)
+        with self._lock:
+            charge = self._request_charges.pop(request_id, None)
+            handle = self.get_instance_handle(req_state.current_instance_index)
+            if handle:
+                if charge is not None and charge[0] == req_state.current_instance_index:
+                    self._decrement_active(handle, charge[1])
+                else:
+                    # The charge sits on a different handle than the
+                    # request's current instance (a migration landed
+                    # between the two bookkeeping updates): release it
+                    # where it actually is.
+                    if charge is not None:
+                        stale = self.get_instance_handle(charge[0])
+                        if stale is not None:
+                            self._discharge_tokens_only(stale, charge[1])
+                    self._decrement_active(handle)
 
         req_state.total_output_tokens = max(0, total_output_tokens)
         if not req_state.collected_return_states:
@@ -432,9 +528,17 @@ class CMLFQScheduler(BaseScheduler):
         if req_state is None:
             return
         handle = self.get_instance_handle(req_state.current_instance_index)
-        if handle:
-            with self._lock:
-                self._decrement_active(handle)
+        with self._lock:
+            charge = self._request_charges.pop(request_id, None)
+            if handle is not None:
+                if charge is not None and charge[0] == req_state.current_instance_index:
+                    self._decrement_active(handle, charge[1])
+                else:
+                    if charge is not None:
+                        stale = self.get_instance_handle(charge[0])
+                        if stale is not None:
+                            self._discharge_tokens_only(stale, charge[1])
+                    self._decrement_active(handle)
 
     # ----------------------------------------------------------------
 
@@ -467,6 +571,7 @@ class CMLFQScheduler(BaseScheduler):
         input_tokens: int,
         prompt_id: str = "",
         reason: str = "",
+        allow_affinity: bool = True,
     ) -> SchedulingResult:
         """Route to bucket."""
         rule = self._bucket_rules.get(bucket)
@@ -479,6 +584,39 @@ class CMLFQScheduler(BaseScheduler):
         with self._lock:
             self._stats.category_counts[bucket] += 1
 
+            # Prefix affinity, inside the chosen bucket only: RL rollouts
+            # replay the same prompt (n_samples, shared system prompts,
+            # retried trajectories), so a warm prefix cache on the sticky
+            # peer beats a marginally emptier cold one. Never applied to a
+            # migration -- that route exists precisely to leave the
+            # current instance, and stickiness would cancel it.
+            if allow_affinity and self._prefix_affinity_enabled:
+                affinity_candidates = self._selectable(
+                    [
+                        h for h in self._instances
+                        if h.is_ready
+                        and h.tp_degree in rule["preferred_tp_degrees"]
+                        and (
+                            self._max_queue_length <= 0
+                            or self._active_count(h, global_counts)
+                            < self._max_queue_length
+                        )
+                    ]
+                )
+                selected = self._affinity_pick(prompt_id, affinity_candidates)
+                if selected is not None:
+                    self._stats.preferred_routes += 1
+                    self._stats.category_tp_counts[bucket][selected.tp_degree] += 1
+                    self._increment_active(selected)
+                    return SchedulingResult(
+                        instance_index=selected.index,
+                        tp_degree=selected.tp_degree,
+                        category=bucket,
+                        is_fallback=False,
+                        reason="prefix_affinity",
+                        prompt_id=prompt_id,
+                        request_id="",
+                    )
 
             selected = self._try_select(
                 rule["preferred_tp_degrees"], global_counts
@@ -517,12 +655,11 @@ class CMLFQScheduler(BaseScheduler):
                     )
 
 
-            all_ready = [h for h in self._instances if h.is_ready]
+            all_ready = self._selectable(
+                [h for h in self._instances if h.is_ready]
+            )
             if all_ready:
-                selected = min(
-                    all_ready,
-                    key=lambda h: self._active_count(h, global_counts),
-                )
+                selected = self._min_load_rotating(all_ready)
                 self._stats.fallback_routes += 1
                 self._stats.category_tp_counts[bucket][selected.tp_degree] += 1
                 self._increment_active(selected)
@@ -561,9 +698,16 @@ class CMLFQScheduler(BaseScheduler):
     def _try_select(
         self,
         tp_preferences: list[int],
-        global_counts: dict[str, int] | None = None,
+        global_counts: dict[str, dict[str, int]] | None = None,
     ) -> Optional[InstanceHandle]:
-        """Try select."""
+        """Pick an instance inside a bucket.
+
+        Bucket peers share a TP degree, so this is where load actually
+        decides placement. The filter order matters: comparability under
+        the metric first (``_selectable`` also applies occupancy admission
+        with hysteresis and the preemption penalty), then the configured
+        concurrency cap, then the ranking.
+        """
         for tp_degree in tp_preferences:
             candidates = [
                 h for h in self._instances_by_tp.get(tp_degree, [])
@@ -571,6 +715,7 @@ class CMLFQScheduler(BaseScheduler):
             ]
             if not candidates:
                 continue
+            candidates = self._selectable(candidates)
             if self._max_queue_length > 0:
                 candidates = [
                     h for h in candidates
@@ -582,14 +727,14 @@ class CMLFQScheduler(BaseScheduler):
                 idx = self._rr_index.get(tp_degree, 0) % len(candidates)
                 self._rr_index[tp_degree] = idx + 1
                 return candidates[idx]
-            else:
-                return min(
-                    candidates,
-                    key=lambda h: self._active_count(h, global_counts),
-                )
+            # ``load_of`` ranks on the tree-residual charge, corrected by
+            # the cross-rank aggregate and the /metrics bias; rotation
+            # keeps equal-load peers from starving when requests complete
+            # between routing calls (low-concurrency multi-turn rollouts).
+            return self._min_load_rotating(candidates)
         return None
 
-    def _get_global_active_counts(self) -> dict[str, int] | None:
+    def _get_global_active_counts(self) -> dict[str, dict[str, int]] | None:
         if self._shared_load is None:
             return None
         return self._shared_load.aggregate()
@@ -597,21 +742,99 @@ class CMLFQScheduler(BaseScheduler):
     @staticmethod
     def _active_count(
         handle: InstanceHandle,
-        global_counts: dict[str, int] | None,
+        global_counts: dict[str, dict[str, int]] | None,
     ) -> int:
         if global_counts is None:
             return handle.active_requests
-        return int(global_counts.get(handle.instance_id, 0))
+        entry = global_counts.get(handle.instance_id)
+        if entry is None:
+            return handle.active_requests
+        if isinstance(entry, dict):
+            return int(entry.get("requests", 0))
+        return int(entry)  # legacy integer snapshot
 
-    def _increment_active(self, handle: InstanceHandle) -> None:
-        handle.inc_active()
-        if self._shared_load is not None:
-            self._shared_load.increment(handle.instance_id)
+    def _increment_active(self, handle: InstanceHandle, delta_tokens: int = 0) -> None:
+        """Count a request, optionally with its token charge.
 
-    def _decrement_active(self, handle: InstanceHandle) -> None:
-        handle.dec_active()
+        Deliberately not ``inc_active``: that installs a fixed FIFO
+        reservation, while our charges are revised in place as the
+        residual estimate changes. ``_request_charges`` is our book of
+        record; the handle only carries the running total.
+        """
+        handle.active_requests += 1
+        handle.charge_tokens(delta_tokens)
         if self._shared_load is not None:
-            self._shared_load.decrement(handle.instance_id)
+            self._shared_load.adjust(
+                handle.instance_id, 1, max(0, int(delta_tokens))
+            )
+
+    def _decrement_active(self, handle: InstanceHandle, delta_tokens: int = 0) -> None:
+        """Retire a request, and with it ``delta_tokens`` of its charge.
+
+        Defaults to retiring the request count only, for the paths where
+        the charge is relocated rather than released (a migration moves
+        it to the destination handle).
+        """
+        handle.active_requests = max(0, handle.active_requests - 1)
+        retired = handle.discharge_tokens(delta_tokens)
+        if retired != max(0, int(delta_tokens)):
+            logger.warning(
+                "[CMLFQ] token charge mismatch on %s: tried to retire %d, "
+                "retired %d (handle drained by a reconfigure?)",
+                handle.instance_id, int(delta_tokens), retired,
+            )
+        if self._shared_load is not None:
+            self._shared_load.adjust(handle.instance_id, -1, -retired)
+
+    def _discharge_tokens_only(self, handle: InstanceHandle, tokens: int) -> None:
+        """Retire tokens without touching the request count."""
+        retired = handle.discharge_tokens(int(tokens))
+        if self._shared_load is not None and retired:
+            self._shared_load.adjust(handle.instance_id, 0, -retired)
+
+    def _expected_residual(
+        self,
+        prompt_id: str,
+        return_states: list[ToolReturnState],
+        fallback_bucket: str,
+    ) -> float:
+        """Expected remaining length from the tree; bucket-midpoint prior.
+
+        No learned EMA by design: within a bucket lengths are bounded and
+        migrations cap the tail, so the tree's conditional histogram (or a
+        cheap midpoint prior) is all the routing signal we need.
+        """
+        try:
+            distribution = self.prefix_tree.residual_distribution(
+                prompt_id, return_states, self._bucket_thresholds
+            )
+        except Exception:
+            distribution = []
+        if distribution:
+            return sum(
+                probability * remaining
+                for _, probability, remaining in distribution
+            )
+        return float(self._bucket_thresholds.get(fallback_bucket, 5000)) / 2.0
+
+    def _set_request_charge(self, request_id: str, instance_index: int, tokens: int) -> None:
+        """Move a request's token reservation to (instance_index, tokens).
+
+        Callers must hold ``self._lock``.
+        """
+        tokens = max(0, int(tokens))
+        previous = self._request_charges.pop(request_id, None)
+        if previous is not None and previous[1]:
+            old_handle = self.get_instance_handle(previous[0])
+            if old_handle is not None:
+                self._discharge_tokens_only(old_handle, previous[1])
+        handle = self.get_instance_handle(instance_index)
+        if handle is not None and tokens:
+            handle.charge_tokens(tokens)
+            if self._shared_load is not None:
+                self._shared_load.adjust(handle.instance_id, 0, tokens)
+        if tokens:
+            self._request_charges[request_id] = (instance_index, tokens)
 
     def _rank_tree_path(self, epoch: int | None = None) -> str:
         path = Path(self._tree_path)
@@ -739,5 +962,18 @@ class CMLFQScheduler(BaseScheduler):
             ),
             shared_load_heartbeat_s=getattr(
                 sched, "cmlfq_shared_load_heartbeat_s", 10.0
+            ),
+            # In-bucket ranking: "tokens" keeps the prefix-tree residual
+            # charge as the load figure; "kv_tokens" additionally
+            # normalizes by each bucket's KV capacity (needs a capacity
+            # table, auto-estimated at config load).
+            load_metric=getattr(sched, "cmlfq_load_metric", "tokens"),
+            kv_capacity_tokens_by_tp=getattr(
+                sched, "kv_capacity_tokens_by_tp", None
+            ),
+            feedback=MetricsFeedbackConfig.from_scheduling(sched),
+            prefix_affinity=bool(getattr(sched, "prefix_affinity", False)),
+            prefix_affinity_max_entries=int(
+                getattr(sched, "prefix_affinity_max_entries", 8192)
             ),
         )

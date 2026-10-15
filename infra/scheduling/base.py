@@ -187,6 +187,10 @@ class InstanceHandle:
     active_requests: int = 0
     active_tokens: int = 0
     kv_capacity_tokens: int = 0
+    # Reservation book for the FIFO accounting model only (see
+    # ``inc_active``). Schedulers that keep their own per-request charge
+    # book use ``charge_tokens``/``discharge_tokens`` and leave this empty;
+    # the two models never drive the same handle.
     _token_estimates: deque = field(default_factory=deque)
 
     def inc_active(
@@ -194,12 +198,15 @@ class InstanceHandle:
         prompt_tokens: int = 0,
         expected_output_tokens: int = 0,
     ):
-        """Account a routed request.
+        """Account a routed request under the FIFO reservation model.
 
         ``active_requests`` counts in-flight requests. ``active_tokens``
         tracks the estimated in-flight token load (prompt + expected
         output). Each estimated request pushes its estimate onto a FIFO
-        queue so the exact same amount is subtracted at completion.
+        queue so the exact same amount is subtracted at completion. The
+        estimate is fixed for the request's lifetime; a scheduler that
+        needs to revise it (a residual re-estimate mid-trajectory) must
+        use the ``charge_tokens`` model instead.
         """
         self.active_requests += 1
         estimate = max(0, int(prompt_tokens)) + max(0, int(expected_output_tokens))
@@ -250,6 +257,30 @@ class InstanceHandle:
     def is_kv_capacitated(self) -> bool:
         """Whether a KV capacity has been assigned to this handle."""
         return self.kv_capacity_tokens > 0
+
+    def charge_tokens(self, tokens: int) -> None:
+        """Add to the in-flight token estimate, request count unchanged.
+
+        The direct accounting model: the caller keeps its own per-request
+        charge book (C-MLFQ's ``_request_charges``) and so needs no
+        reservation queue here. Unlike an ``inc_active`` reservation, a
+        charge is revisable in place -- which is the point, since a tool
+        return changes a trajectory's residual estimate while the request
+        itself stays the same.
+        """
+        self.active_tokens += max(0, int(tokens))
+
+    def discharge_tokens(self, tokens: int) -> int:
+        """Retire part of the in-flight token estimate.
+
+        Returns the amount actually retired, clamped to what is present:
+        a handle drained by a reconfigure cannot give back more than it
+        holds, and silently going negative would corrupt every later
+        ranking decision.
+        """
+        retired = min(max(0, int(tokens)), self.active_tokens)
+        self.active_tokens -= retired
+        return retired
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +416,11 @@ class BaseScheduler(ABC):
             return local
         if self._load_metric == "requests":
             return float(entry.get("requests", 0))
+        if "tokens" not in entry:
+            # The publisher could not vouch for a complete cluster token
+            # sum (a peer predating the token protocol). Ranking on a known
+            # undercount is worse than ranking on our own partial view.
+            return local
         tokens = float(entry.get("tokens", 0))
         if self._load_metric == "kv_tokens":
             capacity = self.kv_capacity_of(handle)

@@ -21,6 +21,9 @@ class CostRoutingDecision(CMLFQMigrationDecision):
     execution_path: str = "stay"
     decode_seconds: float = 0.0
     migration_seconds: float = 0.0
+    # Token reservation bookkeeping for the reserve/commit/rollback flow.
+    reserved_tokens: int = 0      # charge held by this reservation (target)
+    previous_charge: int = 0      # committed charge it replaced (source/current)
 
 
 class CMLFQCostScheduler(CMLFQScheduler):
@@ -153,14 +156,19 @@ class CMLFQCostScheduler(CMLFQScheduler):
             total = decode + movement
             if not math.isfinite(total) or total < 0:
                 continue
-            # Stable ties prefer staying, then the least-loaded instance.
-            choices.append((total, not same, self._active_count(handle, global_counts),
+            # Stable ties prefer staying, then the least-loaded instance
+            # under the base ranking stack (equal cost inside a bucket
+            # differs only by load), with the request count as a final
+            # deterministic key.
+            choices.append((total, not same,
+                            self.load_of(handle),
+                            self._active_count(handle, global_counts),
                             handle.index, decode, movement, path))
         if not choices:
             if not source.is_ready:
                 raise RuntimeError("no available instance with a finite routing cost")
             return stay
-        _, _, _, index, decode, movement, path = min(choices)
+        _, _, _, _, index, decode, movement, path = min(choices)
         target = self.get_instance_handle(index)
         return CostRoutingDecision(
             index != source.index, "distribution_cost", state.current_bucket,
@@ -184,19 +192,41 @@ class CMLFQCostScheduler(CMLFQScheduler):
             if request_id in self._reservations:
                 raise RuntimeError("concurrent generation for the same request")
             state = self._request_states[request_id]
+            context = (self._input_lengths.get(request_id, 0) + state.generated_tokens
+                       if context_tokens is None else context_tokens)
+            previous = self._request_charges.get(
+                request_id, (state.current_instance_index, 0)
+            )
             if request_id in self._pending_cost_routes:
-                decision = self._choose(request_id, context_tokens)
+                decision = self._choose(request_id, context)
             else:
                 decision = CostRoutingDecision(
                     False, "resume", state.current_bucket, target_bucket=state.current_bucket,
                     source_instance_index=state.current_instance_index,
                     target_instance_index=state.current_instance_index,
                 )
+            decision.previous_charge = previous[1]
             target = self.get_instance_handle(decision.target_instance_index)
             if not target.is_ready:
                 raise RuntimeError("selected instance is unavailable")
+            decision.reserved_tokens = int(
+                context + self._expected_residual(
+                    state.prompt_id, state.collected_return_states,
+                    decision.target_bucket,
+                )
+            )
             if decision.should_migrate:
-                self._increment_active(target)
+                # Mirror the request-count double-count semantics: the
+                # target holds a provisional (count + token) reservation
+                # until commit; the source keeps its committed charge.
+                self._increment_active(target, decision.reserved_tokens)
+            else:
+                # Stay (resume or cost-stay): refresh the reservation to
+                # the grown context + current residual (token-only move).
+                self._set_request_charge(
+                    request_id, decision.target_instance_index,
+                    decision.reserved_tokens,
+                )
             self._reservations[request_id] = decision
             return decision
 
@@ -207,19 +237,38 @@ class CMLFQCostScheduler(CMLFQScheduler):
             self._reservations.pop(request_id)
             state = self._request_states[request_id]
             if decision.should_migrate:
-                self._decrement_active(self.get_instance_handle(state.current_instance_index))
+                source = self.get_instance_handle(state.current_instance_index)
+                if source is not None:
+                    # Retire the source's committed count and the exact
+                    # charge it was holding for this request.
+                    self._decrement_active(source, decision.previous_charge)
                 state.current_instance_index = decision.target_instance_index
                 state.current_bucket = decision.target_bucket
                 state.has_migrated = True
                 self._migration_count += 1
                 self._stats.migrated_routes += 1
+                self._request_charges[request_id] = (
+                    decision.target_instance_index, decision.reserved_tokens,
+                )
             self._pending_cost_routes.discard(request_id)
 
     def rollback_generation(self, request_id: str):
         with self._lock:
             reservation = self._reservations.pop(request_id, None)
-            if reservation is not None and reservation.should_migrate:
-                self._decrement_active(self.get_instance_handle(reservation.target_instance_index))
+            if reservation is None:
+                return
+            if reservation.should_migrate:
+                target = self.get_instance_handle(reservation.target_instance_index)
+                if target is not None:
+                    self._decrement_active(target, reservation.reserved_tokens)
+            else:
+                # Resume refresh: restore the previous committed charge.
+                state = self._request_states.get(request_id)
+                if state is not None:
+                    self._set_request_charge(
+                        request_id, state.current_instance_index,
+                        reservation.previous_charge,
+                    )
 
     def cancel_request(self, request_id: str):
         with self._lock:

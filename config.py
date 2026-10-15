@@ -305,9 +305,15 @@ class SchedulingConfig:
     # request-count based), "tokens" (estimated in-flight token load,
     # prompt + EMA-expected output), or "kv_tokens" (the same token load
     # normalized by each TP bucket's estimated KV-cache capacity in tokens).
-    # Applies to load_balance / length_aware / la_mlfq schedulers; cmlfq
-    # keeps its own workload-aware routing.
+    # Applies to load_balance / length_aware / la_mlfq schedulers.
     load_metric: str = "requests"
+
+    # Same metric, for cmlfq / cmlfq_cost in-bucket instance selection.
+    # Separate because cmlfq's in-flight token figure is the prefix-tree
+    # residual charge (context + E[residual], refreshed on tool returns),
+    # not the per-category output EMA the metrics above are built on --
+    # ranking bucket peers by "requests" would discard that estimate.
+    cmlfq_load_metric: str = "tokens"
 
     # Explicit KV capacity override (tokens) per TP degree, e.g. {1: 120000,
     # 2: 230000, 4: 450000}. When empty and load_metric is "kv_tokens",
@@ -1008,15 +1014,20 @@ class AsyncRLConfig:
         """Auto-fill scheduling.kv_capacity_tokens_by_tp when needed.
 
         Only runs for heterogeneous rollouts using the capacity-normalized
-        ``kv_tokens`` load metric without an explicit capacity table. The
-        estimate follows vLLM's budget rule: per GPU, the utilization
-        fraction of HBM minus sharded weights and an activation reserve,
-        divided by the per-token KV bytes of the bucket's TP layout.
+        ``kv_tokens`` load metric (either the general one or cmlfq's)
+        without an explicit capacity table. The estimate follows vLLM's
+        budget rule: per GPU, the utilization fraction of HBM minus
+        sharded weights and an activation reserve, divided by the
+        per-token KV bytes of the bucket's TP layout.
         """
         sched = self.heterogeneous_rollout.scheduling
         if not self.heterogeneous_rollout.enabled:
             return
-        if getattr(sched, "load_metric", "") != "kv_tokens":
+        metrics = {
+            getattr(sched, "load_metric", ""),
+            getattr(sched, "cmlfq_load_metric", ""),
+        }
+        if "kv_tokens" not in metrics:
             return
         if sched.kv_capacity_tokens_by_tp:
             return
